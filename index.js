@@ -1,7 +1,6 @@
 require("dotenv").config();
 
 const express = require("express");
-const cron = require("node-cron");
 const Database = require("better-sqlite3");
 const line = require("@line/bot-sdk");
 
@@ -10,14 +9,18 @@ const {
   CHANNEL_SECRET,
   GROUP1_ID,
   GROUP2_ID,
+  REPORT_TOKEN, // ✅ 추가: 리포트 트리거용 토큰
   PORT = 3000,
-  DEBUG = "0", // .env에 DEBUG=1 넣으면 로그 좀 더 나옴
+  DEBUG = "0",
 } = process.env;
 
 if (!CHANNEL_ACCESS_TOKEN || !CHANNEL_SECRET || !GROUP1_ID || !GROUP2_ID) {
   throw new Error(
     "Missing env vars: CHANNEL_ACCESS_TOKEN/CHANNEL_SECRET/GROUP1_ID/GROUP2_ID"
   );
+}
+if (!REPORT_TOKEN) {
+  throw new Error("Missing env var: REPORT_TOKEN");
 }
 
 const config = {
@@ -30,15 +33,6 @@ const client = new line.messagingApi.MessagingApiClient({
 });
 
 const app = express();
-
-app.post("/webhook", line.middleware(config), (req, res) => {
-  // ✅ LINE이 요구하는 건 "빠른 200 OK"
-  res.status(200).send("OK");
-
-  // ✅ 처리는 뒤에서 비동기로
-  const events = req.body.events || [];
-  Promise.all(events.map(handleEvent)).catch((e) => console.error("[WEBHOOK_ERR]", e));
-});
 
 // ---- DB ----
 const db = new Database("counts.db");
@@ -93,7 +87,50 @@ function incCount(ymd, groupId, userId) {
   stmt.run({ ymd, groupId, userId });
 }
 
-// ---- Webhook handler ----
+async function sendDailyReportForYmd(ymd) {
+  const rows = db
+    .prepare(
+      `SELECT user_id, count FROM daily_counts
+       WHERE ymd = ? AND group_id = ?
+       ORDER BY count DESC`
+    )
+    .all(ymd, GROUP1_ID);
+
+  if (rows.length === 0) {
+    await client.pushMessage({
+      to: GROUP2_ID,
+      messages: [{ type: "text", text: `(${ymd}) 1번 단톡 마디수 집계: 기록 없음` }],
+    });
+    return;
+  }
+
+  const lines = [];
+  for (const r of rows) {
+    const name = await getDisplayName(GROUP1_ID, r.user_id);
+    lines.push(`${name}: ${r.count}`);
+  }
+
+  const text =
+    `(${ymd}) 1번 단톡 마디수(사진/이모티콘 제외, 3글자 이상)\n` +
+    lines.join("\n");
+
+  await client.pushMessage({
+    to: GROUP2_ID,
+    messages: [{ type: "text", text }],
+  });
+
+  // 전날 데이터 삭제(원하면 주석처리)
+  db.prepare(`DELETE FROM daily_counts WHERE ymd = ? AND group_id = ?`).run(ymd, GROUP1_ID);
+}
+
+// ---- Webhook ----
+// ✅ Verify 타임아웃 방지: 먼저 200 OK부터 반환
+app.post("/webhook", line.middleware(config), (req, res) => {
+  res.status(200).send("OK");
+  const events = req.body.events || [];
+  Promise.all(events.map(handleEvent)).catch((e) => console.error("[WEBHOOK_ERR]", e));
+});
+
 async function handleEvent(event) {
   // 단톡만
   if (!event?.source || event.source.type !== "group") return;
@@ -108,8 +145,6 @@ async function handleEvent(event) {
   if (event.type !== "message") return;
 
   const message = event.message || {};
-
-  // 텍스트만 (사진/스티커/파일 등 제외)
   if (message.type !== "text") return;
 
   const text = message.text || "";
@@ -119,65 +154,34 @@ async function handleEvent(event) {
   incCount(today, groupId, userId);
 
   if (DEBUG === "1") {
-    console.log(`[COUNT] ${today} group=${groupId} user=${userId} text="${text}"`);
+    console.log(`[COUNT] ${today} user=${userId} text="${text}"`);
   }
 }
 
-// ---- Daily report at 00:00 Asia/Seoul ----
-cron.schedule(
-  "0 0 * * *",
-  async () => {
+// ---- Report Trigger Endpoint ----
+// Render Cron Job이 이 URL을 하루 1번 호출하게 만들 거야.
+app.get("/run-report", (req, res) => {
+  if (req.query.token !== REPORT_TOKEN) {
+    return res.status(401).send("Unauthorized");
+  }
+
+  // ✅ 호출 즉시 응답
+  res.status(200).send("OK");
+
+  // ✅ 어제 리포트 비동기 실행
+  (async () => {
     const now = new Date();
     const yesterday = new Date(now);
     yesterday.setDate(now.getDate() - 1);
-
     const ymd = ymdOf(yesterday);
 
-    try {
-      const rows = db
-        .prepare(
-          `SELECT user_id, count FROM daily_counts
-           WHERE ymd = ? AND group_id = ?
-           ORDER BY count DESC`
-        )
-        .all(ymd, GROUP1_ID);
+    console.log("[REPORT_TRIGGER]", new Date().toISOString(), "ymd=", ymd);
 
-      if (rows.length === 0) {
-        await client.pushMessage({
-          to: GROUP2_ID,
-          messages: [{ type: "text", text: `(${ymd}) 1번 단톡 마디수 집계: 기록 없음` }],
-        });
-        return;
-      }
+    await sendDailyReportForYmd(ymd);
 
-      const lines = [];
-      for (const r of rows) {
-        const name = await getDisplayName(GROUP1_ID, r.user_id);
-        lines.push(`${name}: ${r.count}`);
-      }
-
-      const text =
-        `(${ymd}) 1번 단톡 마디수(사진/이모티콘 제외, 3글자 이상)\n` +
-        lines.join("\n");
-
-      await client.pushMessage({
-        to: GROUP2_ID,
-        messages: [{ type: "text", text }],
-      });
-
-      // 전날 데이터 삭제(원하면 주석처리해서 누적도 가능)
-      db.prepare(`DELETE FROM daily_counts WHERE ymd = ? AND group_id = ?`).run(
-        ymd,
-        GROUP1_ID
-      );
-
-      if (DEBUG === "1") console.log(`[REPORT_SENT] ${ymd} rows=${rows.length}`);
-    } catch (e) {
-      console.error("[CRON_ERR]", e);
-    }
-  },
-  { timezone: "Asia/Seoul" }
-);
+    console.log("[REPORT_DONE]", new Date().toISOString(), "ymd=", ymd);
+  })().catch((e) => console.error("[REPORT_ERR]", e));
+});
 
 app.get("/", (_, res) => res.send("LINE bot OK"));
 app.listen(PORT, () => console.log(`Listening on ${PORT}`));
