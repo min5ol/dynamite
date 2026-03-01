@@ -31,15 +31,13 @@ const client = new line.messagingApi.MessagingApiClient({
 
 const app = express();
 
-app.post("/webhook", line.middleware(config), async (req, res) => {
-  try {
-    const events = req.body.events || [];
-    await Promise.all(events.map(handleEvent));
-    res.status(200).send("OK");
-  } catch (e) {
-    console.error("[WEBHOOK_ERR]", e);
-    res.status(500).send("ERR");
-  }
+app.post("/webhook", line.middleware(config), (req, res) => {
+  // ✅ LINE이 요구하는 건 "빠른 200 OK"
+  res.status(200).send("OK");
+
+  // ✅ 처리는 뒤에서 비동기로
+  const events = req.body.events || [];
+  Promise.all(events.map(handleEvent)).catch((e) => console.error("[WEBHOOK_ERR]", e));
 });
 
 // ---- DB ----
