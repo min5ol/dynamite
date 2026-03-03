@@ -89,12 +89,26 @@ function incCount(ymd, groupId, userId) {
 
 async function sendDailyReportForYmd(ymd) {
   const rows = db
+  
     .prepare(
       `SELECT user_id, count FROM daily_counts
        WHERE ymd = ? AND group_id = ?
        ORDER BY count DESC`
     )
     .all(ymd, GROUP1_ID);
+
+    try {
+  console.log("PUSH TO:", GROUP2_ID);
+
+  await client.pushMessage({
+    to: GROUP2_ID,
+    messages: [{ type: "text", text }],
+  });
+
+  console.log("PUSH SUCCESS");
+} catch (e) {
+  console.error("PUSH FAILED:", e.response?.data || e);
+}
 
   if (rows.length === 0) {
     await client.pushMessage({
