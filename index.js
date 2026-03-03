@@ -9,18 +9,14 @@ const {
   CHANNEL_SECRET,
   GROUP1_ID,
   GROUP2_ID,
-  REPORT_TOKEN, // ✅ 추가: 리포트 트리거용 토큰
+  REPORT_TOKEN,
   PORT = 3000,
   DEBUG = "0",
 } = process.env;
 
-if (!CHANNEL_ACCESS_TOKEN || !CHANNEL_SECRET || !GROUP1_ID || !GROUP2_ID) {
-  throw new Error(
-    "Missing env vars: CHANNEL_ACCESS_TOKEN/CHANNEL_SECRET/GROUP1_ID/GROUP2_ID"
-  );
-}
-if (!REPORT_TOKEN) {
-  throw new Error("Missing env var: REPORT_TOKEN");
+// 환경변수 체크
+if (!CHANNEL_ACCESS_TOKEN || !CHANNEL_SECRET || !GROUP1_ID || !GROUP2_ID || !REPORT_TOKEN) {
+  throw new Error("Missing required environment variables in .env file.");
 }
 
 const config = {
@@ -28,13 +24,14 @@ const config = {
   channelSecret: CHANNEL_SECRET,
 };
 
+// Messaging API Client 설정
 const client = new line.messagingApi.MessagingApiClient({
   channelAccessToken: CHANNEL_ACCESS_TOKEN,
 });
 
 const app = express();
 
-// ---- DB ----
+// ---- DB 설정 ----
 const db = new Database("counts.db");
 db.exec(`
 CREATE TABLE IF NOT EXISTS daily_counts (
@@ -46,6 +43,7 @@ CREATE TABLE IF NOT EXISTS daily_counts (
 );
 `);
 
+// 날짜 포맷팅 함수 (YYYY-MM-DD)
 function ymdOf(date) {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, "0");
@@ -53,6 +51,7 @@ function ymdOf(date) {
   return `${y}-${m}-${d}`;
 }
 
+// 이모지 및 공백 제거 함수
 function stripEmojiAndSpaces(s) {
   let t = (s || "").replace(/\s+/g, "");
   try {
@@ -63,20 +62,23 @@ function stripEmojiAndSpaces(s) {
   return t;
 }
 
+// 집계 대상 텍스트인지 확인 (3글자 이상)
 function isCountableText(text) {
   const cleaned = stripEmojiAndSpaces(text);
   return cleaned.length >= 3;
 }
 
+// 사용자 닉네임 가져오기
 async function getDisplayName(groupId, userId) {
   try {
     const profile = await client.getGroupMemberProfile(groupId, userId);
-    return profile.displayName || userId;
-  } catch {
-    return userId;
+    return profile.displayName || "Unknown";
+  } catch (err) {
+    return userId; // 프로필 못 가져오면 ID 그대로 반환
   }
 }
 
+// 카운트 증가 함수
 function incCount(ymd, groupId, userId) {
   const stmt = db.prepare(`
     INSERT INTO daily_counts (ymd, group_id, user_id, count)
@@ -87,9 +89,9 @@ function incCount(ymd, groupId, userId) {
   stmt.run({ ymd, groupId, userId });
 }
 
+// 리포트 생성 및 전송 함수
 async function sendDailyReportForYmd(ymd) {
   const rows = db
-  
     .prepare(
       `SELECT user_id, count FROM daily_counts
        WHERE ymd = ? AND group_id = ?
@@ -97,48 +99,40 @@ async function sendDailyReportForYmd(ymd) {
     )
     .all(ymd, GROUP1_ID);
 
-    try {
-  console.log("PUSH TO:", GROUP2_ID);
+  console.log(`[REPORT] Processing report for ${ymd}, rows: ${rows.length}`);
 
-  await client.pushMessage({
-    to: GROUP2_ID,
-    messages: [{ type: "text", text }],
-  });
-
-  console.log("PUSH SUCCESS");
-} catch (e) {
-  console.error("PUSH FAILED:", e.response?.data || e);
-}
+  let reportMessage = "";
 
   if (rows.length === 0) {
+    reportMessage = `(${ymd}) 1번 단톡 마디수 집계: 기록 없음`;
+  } else {
+    const lines = [];
+    // 닉네임 변환 (순차 처리)
+    for (const r of rows) {
+      const name = await getDisplayName(GROUP1_ID, r.user_id);
+      lines.push(`${name}: ${r.count}`);
+    }
+    reportMessage =
+      `(${ymd}) 1번 단톡 마디수(사진/이모티콘 제외, 3글자 이상)\n` +
+      lines.join("\n");
+  }
+
+  // GROUP2_ID로 결과 전송
+  try {
     await client.pushMessage({
       to: GROUP2_ID,
-      messages: [{ type: "text", text: `(${ymd}) 1번 단톡 마디수 집계: 기록 없음` }],
+      messages: [{ type: "text", text: reportMessage }],
     });
-    return;
+    console.log("[REPORT] Push Success to Group 2");
+
+    // 전송 후 데이터 삭제 (필요하면 활성화)
+    // db.prepare(`DELETE FROM daily_counts WHERE ymd = ? AND group_id = ?`).run(ymd, GROUP1_ID);
+  } catch (e) {
+    console.error("[REPORT] Push Failed:", e.message);
   }
-
-  const lines = [];
-  for (const r of rows) {
-    const name = await getDisplayName(GROUP1_ID, r.user_id);
-    lines.push(`${name}: ${r.count}`);
-  }
-
-  const text =
-    `(${ymd}) 1번 단톡 마디수(사진/이모티콘 제외, 3글자 이상)\n` +
-    lines.join("\n");
-
-  await client.pushMessage({
-    to: GROUP2_ID,
-    messages: [{ type: "text", text }],
-  });
-
-  // 전날 데이터 삭제(원하면 주석처리)
-  db.prepare(`DELETE FROM daily_counts WHERE ymd = ? AND group_id = ?`).run(ymd, GROUP1_ID);
 }
 
 // ---- Webhook ----
-// ✅ Verify 타임아웃 방지: 먼저 200 OK부터 반환
 app.post("/webhook", line.middleware(config), (req, res) => {
   res.status(200).send("OK");
   const events = req.body.events || [];
@@ -146,22 +140,16 @@ app.post("/webhook", line.middleware(config), (req, res) => {
 });
 
 async function handleEvent(event) {
-  // 단톡만
   if (!event?.source || event.source.type !== "group") return;
 
   const groupId = event.source.groupId;
   const userId = event.source.userId;
 
-  // 1번 단톡만 집계
-  if (!groupId || groupId !== GROUP1_ID) return;
-  if (!userId) return;
+  // 1번 단톡방 메시지만 집계
+  if (groupId !== GROUP1_ID || !userId) return;
+  if (event.type !== "message" || event.message.type !== "text") return;
 
-  if (event.type !== "message") return;
-
-  const message = event.message || {};
-  if (message.type !== "text") return;
-
-  const text = message.text || "";
+  const text = event.message.text || "";
   if (!isCountableText(text)) return;
 
   const today = ymdOf(new Date());
@@ -173,29 +161,24 @@ async function handleEvent(event) {
 }
 
 // ---- Report Trigger Endpoint ----
-// Render Cron Job이 이 URL을 하루 1번 호출하게 만들 거야.
 app.get("/run-report", (req, res) => {
   if (req.query.token !== REPORT_TOKEN) {
     return res.status(401).send("Unauthorized");
   }
 
-  // ✅ 호출 즉시 응답
-  res.status(200).send("OK");
+  res.status(200).send("Report process started");
 
-  // ✅ 어제 리포트 비동기 실행
   (async () => {
     const now = new Date();
     const yesterday = new Date(now);
     yesterday.setDate(now.getDate() - 1);
     const ymd = ymdOf(yesterday);
 
-    console.log("[REPORT_TRIGGER]", new Date().toISOString(), "ymd=", ymd);
-
+    console.log("[TRIGGER] Running report for:", ymd);
     await sendDailyReportForYmd(ymd);
-
-    console.log("[REPORT_DONE]", new Date().toISOString(), "ymd=", ymd);
-  })().catch((e) => console.error("[REPORT_ERR]", e));
+  })().catch((e) => console.error("[TRIGGER_ERR]", e));
 });
 
-app.get("/", (_, res) => res.send("LINE bot OK"));
-app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+app.get("/", (_, res) => res.send("LINE bot is running..."));
+
+app.listen(PORT, () => console.log(`Server is listening on port ${PORT}`));
