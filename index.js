@@ -166,17 +166,24 @@ app.get("/run-report", (req, res) => {
     return res.status(401).send("Unauthorized");
   }
 
-  res.status(200).send("Report process started");
+  res.status(200).send("OK");
 
   (async () => {
-    const now = new Date();
-    const yesterday = new Date(now);
-    yesterday.setDate(now.getDate() - 1);
-    const ymd = ymdOf(yesterday);
+    // 1. 현재 한국 시간 구하기 (서버가 어느 나라에 있든 상관없음)
+    const nowKst = new Date(new Date().getTime() + (9 * 60 * 60 * 1000));
+    
+    // 2. 한국 시간 기준으로 "어제" 구하기
+    const yesterdayKst = new Date(nowKst);
+    yesterdayKst.setDate(nowKst.getDate());
+    
+    const ymd = ymdOf(yesterdayKst);
 
-    console.log("[TRIGGER] Running report for:", ymd);
+    console.log("[REPORT_TRIGGER] KST 기준 실행:", new Date().toISOString(), "대상 날짜(ymd)=", ymd);
+
     await sendDailyReportForYmd(ymd);
-  })().catch((e) => console.error("[TRIGGER_ERR]", e));
+
+    console.log("[REPORT_DONE] 완료 ymd=", ymd);
+  })().catch((e) => console.error("[REPORT_ERR]", e));
 });
 
 app.get("/", (_, res) => res.send("LINE bot is running..."));
