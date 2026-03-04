@@ -174,7 +174,7 @@ app.get("/run-report", (req, res) => {
     
     // 2. 한국 시간 기준으로 "어제" 구하기
     const yesterdayKst = new Date(nowKst);
-    yesterdayKst.setDate(nowKst.getDate());
+    yesterdayKst.setDate(nowKst.getDate() - 1);
     
     const ymd = ymdOf(yesterdayKst);
 
